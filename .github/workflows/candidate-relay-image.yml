@@ -1,0 +1,228 @@
+name: Candidate relay image (linux/amd64)
+
+# Minimal, fork-scoped CI build of ONE immutable candidate image from the frozen
+# Buzz Relay commit 3c68dbaa12da9fea86821fad78d0eed8ddb60f62.
+#
+# Why this is a small new workflow and not a reuse of .github/workflows/docker.yml:
+#   * docker.yml publishes ghcr.io/block/buzz (overridable only via the
+#     vars.GHCR_IMAGE repository variable), fans out to an amd64+arm64 matrix
+#     on two native runners, and stitches a multi-arch manifest.
+#   * Its tag matrix is :main / :sha-<7> / semver — it can never emit the
+#     full-40-char-SHA immutable tag this candidate is required to carry.
+#   * Its workflow_dispatch path is a relay-tag rescue guarded by
+#     scripts/verify-release-ref.sh relay-v <version>, so it deliberately
+#     refuses to build an arbitrary frozen SHA.
+# Nothing in Buzz's source, Dockerfile or upstream release workflow is modified.
+#
+# Deliberate properties of this workflow:
+#   * checkout is pinned to the frozen SHA, and the SHA is re-asserted after
+#     checkout — the build input is exactly 3c68dba…
+#   * exactly one platform: linux/amd64 (no QEMU, no arm64 leg)
+#   * exactly one tag: the full source SHA — never `latest`, `main`, `sha-<7>`
+#   * GITHUB_TOKEN only; permissions limited to contents:read + packages:write
+#   * no provenance/SBOM attestations, so the pushed tag is a plain
+#     single-platform manifest and its digest *is* the image digest
+#
+# The only edit to the checked-out tree is the OCI `image.source` annotation
+# (metadata, not code): it is retargeted from the upstream repository to this
+# fork so GHCR links the package to the namespace whose token performs the
+# push. No compiled artifact is affected.
+#
+# Trigger: push to the dedicated branch below. `workflow_dispatch` is included
+# so the same file also works from the default branch later; until then,
+# re-run with `gh run rerun <id>`.
+on:
+  push:
+    branches: [ci/candidate-image-3c68dba]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: candidate-relay-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 3c68dbaa12da9fea86821fad78d0eed8ddb60f62
+  IMAGE: ghcr.io/zyi75/buzz
+  PLATFORM: linux/amd64
+
+jobs:
+  candidate:
+    name: Build + publish candidate image (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout frozen Buzz Relay commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: 3c68dbaa12da9fea86821fad78d0eed8ddb60f62
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checked-out commit
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "checked out HEAD: ${actual}"
+          test "${actual}" = "${SOURCE_SHA}"
+          git --no-pager log -1 --format='%H%n%s%n%ad'
+
+      - name: Retarget OCI source annotation to this fork
+        run: |
+          set -euo pipefail
+          matches="$(grep -c 'org.opencontainers.image.source="https://github.com/block/buzz"' Dockerfile)"
+          echo "occurrences of upstream source annotation: ${matches}"
+          test "${matches}" -eq 1
+          sed -i \
+            's#org.opencontainers.image.source="https://github.com/block/buzz"#org.opencontainers.image.source="https://github.com/zyi75/buzz"#' \
+            Dockerfile
+          grep -n 'org.opencontainers.image.source' Dockerfile
+          echo "--- build-context diff (metadata annotation only) ---"
+          git --no-pager diff --stat
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        with:
+          # Same cap upstream uses: full default parallelism OOMs the runner
+          # during the Rust release build (moby/buildkit#3969).
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Preflight — prove GITHUB_TOKEN can push to this package
+        # Decisive and cheap: GHCR mints no scoped JWT for GitHub-token
+        # credentials (the token endpoint echoes the credential itself, base64),
+        # so push permission can only be proven by an actual registry write.
+        # This pushes an empty `FROM scratch` image — nothing to pull, a few
+        # seconds — to the same package path under a clearly non-candidate tag,
+        # so a 403 (or a source-annotation namespace conflict) surfaces now
+        # instead of after the ~1h Rust build.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ghcr-preflight
+          printf 'FROM scratch\nLABEL org.opencontainers.image.source="https://github.com/zyi75/buzz"\n' \
+            > /tmp/ghcr-preflight/Dockerfile
+          docker buildx build --platform "${PLATFORM}" --provenance=false --sbom=false \
+            --tag "${IMAGE}:ci-push-preflight" --push /tmp/ghcr-preflight
+
+      - name: Remove preflight tag (best effort, never fatal)
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          id="$(curl -fsS \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user/packages/container/buzz/versions?per_page=100" \
+            | jq -r '[.[] | select((.metadata.container.tags // []) | index("ci-push-preflight"))][0].id // empty')"
+          if [ -n "${id}" ]; then
+            curl -fsS -X DELETE \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/buzz/versions/${id}"
+            echo "deleted preflight package version ${id}"
+          else
+            echo "no preflight package version to delete"
+          fi
+
+      - name: Build and push candidate image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/zyi75/buzz:3c68dbaa12da9fea86821fad78d0eed8ddb60f62
+          labels: |
+            org.opencontainers.image.source=https://github.com/zyi75/buzz
+          provenance: false
+          sbom: false
+          build-args: |
+            BUZZ_SOURCE_SHA=3c68dbaa12da9fea86821fad78d0eed8ddb60f62
+            BUZZ_BUILD_ID=github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+            BUZZ_BUILD_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Verify published artifact (platform + immutable digest)
+        id: verify
+        env:
+          PUSHED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${SOURCE_SHA}"
+          echo "digest: ${PUSHED_DIGEST}"
+
+          # Registry-side media type: a plain single-platform manifest, not an
+          # index / attestation wrapper.
+          media_type="$(docker buildx imagetools inspect --raw "${ref}" | jq -r '.mediaType')"
+          echo "registry manifest mediaType: ${media_type}"
+          case "${media_type}" in
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json) ;;
+            *) echo "::error::unexpected manifest media type: ${media_type}"; exit 1 ;;
+          esac
+
+          # Pull the exact published artifact back and read the platform out of
+          # its image config.
+          docker pull --platform "${PLATFORM}" "${ref}"
+          os="$(docker image inspect "${ref}" --format '{{.Os}}')"
+          arch="$(docker image inspect "${ref}" --format '{{.Architecture}}')"
+          repo_digest="$(docker image inspect "${ref}" --format '{{index .RepoDigests 0}}')"
+          echo "platform: ${os}/${arch}"
+          echo "repo digest: ${repo_digest}"
+          test "${os}" = "linux"
+          test "${arch}" = "amd64"
+
+          cat > candidate.json <<JSON
+          {
+            "candidate_image_ready": true,
+            "source_commit": "${SOURCE_SHA}",
+            "image": "${IMAGE}",
+            "tag": "${SOURCE_SHA}",
+            "reference": "${ref}",
+            "digest": "${PUSHED_DIGEST}",
+            "repo_digest": "${repo_digest}",
+            "platform": "${os}/${arch}",
+            "manifest_media_type": "${media_type}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_attempt": "${GITHUB_RUN_ATTEMPT}"
+          }
+          JSON
+          cat candidate.json
+
+          {
+            echo "## Candidate relay image — CANDIDATE_IMAGE_READY = YES"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source commit | \`${SOURCE_SHA}\` |"
+            echo "| reference | \`${ref}\` |"
+            echo "| immutable digest | \`${PUSHED_DIGEST}\` |"
+            echo "| repo digest | \`${repo_digest}\` |"
+            echo "| platform | \`${os}/${arch}\` |"
+            echo "| manifest media type | \`${media_type}\` |"
+            echo "| run | \`${GITHUB_RUN_ID}\` attempt \`${GITHUB_RUN_ATTEMPT}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: candidate-image-record
+          path: candidate.json
+          if-no-files-found: error
+          retention-days: 90
