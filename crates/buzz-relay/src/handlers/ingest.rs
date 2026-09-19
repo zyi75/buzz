@@ -2250,7 +2250,12 @@ async fn ingest_event_inner(
     }
 
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
+    let delegated = matches!(auth, IngestAuth::Nip42 { .. })
+        && state
+            .config
+            .delegated_publish_acl
+            .authorizes(auth.pubkey(), &event);
+    if event.pubkey != *auth.pubkey() && !is_gift_wrap && !delegated {
         return Err(IngestError::AuthFailed(
             "invalid: event pubkey does not match authenticated identity".into(),
         ));

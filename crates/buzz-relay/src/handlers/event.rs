@@ -656,7 +656,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     // events get a second check inside ingest_event() (step 3), but
     // ephemeral events bypass the pipeline entirely.
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != auth_pubkey && !is_gift_wrap {
+    if is_ephemeral(kind_u32) && event.pubkey != auth_pubkey && !is_gift_wrap {
         reject("invalid");
         conn.send(RelayMessage::ok(
             &event_id_hex,

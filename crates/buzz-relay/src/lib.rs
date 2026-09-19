@@ -4,6 +4,8 @@
 
 mod admission;
 mod build_info;
+/// Explicit, fail-closed authorization for transporting events signed by another identity.
+pub mod delegated_publish;
 mod rejection;
 
 /// REST API route handlers.

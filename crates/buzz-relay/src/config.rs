@@ -209,6 +209,9 @@ pub struct Config {
     /// are permitted regardless of auth method (API token, NIP-42).
     pub require_relay_membership: bool,
 
+    /// Explicit delegated-publish grants. Empty by default, so author/publisher mismatch is denied.
+    pub delegated_publish_acl: crate::delegated_publish::DelegatedPublishAcl,
+
     /// Whether this deployment can serve huddle (voice) audio.
     ///
     /// Huddle audio frames are relayed peer-to-peer *within a single pod*
@@ -669,6 +672,24 @@ impl Config {
         let require_relay_membership = std::env::var("BUZZ_REQUIRE_RELAY_MEMBERSHIP")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+
+        let delegated_publish_acl = match std::env::var("BUZZ_DELEGATED_PUBLISH_ACL_JSON") {
+            Ok(raw) if raw.trim().is_empty() => {
+                return Err(ConfigError::InvalidValue(
+                    "BUZZ_DELEGATED_PUBLISH_ACL_JSON must not be empty".to_string(),
+                ));
+            }
+            Ok(raw) => crate::delegated_publish::DelegatedPublishAcl::parse(&raw)
+                .map_err(ConfigError::InvalidValue)?,
+            Err(std::env::VarError::NotPresent) => {
+                crate::delegated_publish::DelegatedPublishAcl::default()
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidValue(
+                    "BUZZ_DELEGATED_PUBLISH_ACL_JSON must be valid UTF-8".to_string(),
+                ));
+            }
+        };
 
         // Defaults true → single-pod (N=1) keeps today's huddle behavior. A
         // horizontally-scaled deployment sets this false; see the field doc.
@@ -1234,6 +1255,7 @@ impl Config {
             metrics_port,
             pubkey_allowlist_enabled,
             require_relay_membership,
+            delegated_publish_acl,
             huddle_audio_available,
             mesh,
             mesh_demo_echo,
